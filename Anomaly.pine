@@ -1,0 +1,112 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Ikuma-Hiroyuki
+
+//@version=5
+
+indicator('Anomaly Trend', 'Anomaly', overlay=true, max_labels_count=180, scale=scale.right)
+
+string rightOffsetTooltip = '過去同日の終値を平均し将来の日付に表示します。' + '\n同日が休日だった場合その翌日終値を取得します。\n(日足チャートのみ有効)'
+int rightOffset = input.int(defval=60, title='チャート右側の日数', tooltip=rightOffsetTooltip, minval=1, maxval=90)
+bool isDebug = input.bool(defval=true, title='Debug', tooltip='取得した過去同日の日付と価格を表示します')
+bool isDebug2 = input(defval=false, title='Debug2')
+
+int oneDay = 86400000  // 1000ミリ秒*3600秒*24時間
+int oneYear = 31536000000  // 86400000*365日
+
+int barDate = timestamp(year(time), month(time), dayofmonth(time), 0, 0)  // バーの日にち。0時で固定
+int timenow2 = timestamp(year(timenow), month(timenow), dayofmonth(timenow), 0, 0) - oneDay  // 最新の取引所の日にちはtimenowから-1日
+int lastPastDate = timenow2 - oneDay * rightOffset * 2  // 最古の遡り基準日。この日+rightOffset分先にプロットする
+
+
+ToDateString(_time) =>
+    weekName = dayofweek(_time) == dayofweek.monday    ? '月' :
+               dayofweek(_time) == dayofweek.tuesday   ? '火' :
+               dayofweek(_time) == dayofweek.wednesday ? '水' :
+               dayofweek(_time) == dayofweek.thursday  ? '木' :
+               dayofweek(_time) == dayofweek.friday    ? '金' :
+               dayofweek(_time) == dayofweek.saturday  ? '土' :
+               dayofweek(_time) == dayofweek.sunday    ? '日' :
+               ''
+    str.format('{0,date,Y-MM-dd}-{1}', _time, weekName)
+
+
+ToLabelString(_pastBarCnt, _closeAvg) =>
+    ToDateString(time[_pastBarCnt]) + '\t' + str.tostring(close[_pastBarCnt], format.mintick) + '\t\t' + _closeAvg + '\n'
+
+
+CalcPastDate(_time, traceBackYear, traceBackDate) =>
+    timestamp(year(_time) - traceBackYear,
+              month(_time),
+              dayofmonth(_time) - traceBackDate,
+              hour(_time),
+              minute(_time))
+              + oneDay * rightOffset
+
+
+GetPast(_isDebug) =>
+    if timeframe.isdaily
+        [plotVal, labelString, cycle] = if barDate >= lastPastDate
+            string labelStr = ''
+            if isDebug
+                labelStr := '(参考)' + ToLabelString(0, '') + '\n' + 'Date\t\t\tClose\t\tClose Average\n'
+
+            float[] closes = array.new_float(0)
+            int cycle = int((time - time[bar_index]) / oneYear)
+            for pastYearCnt = 1 to cycle by 1
+                for pastBarCnt = bar_index to 0 by 1
+                    pastDate = CalcPastDate(time, pastYearCnt, 0)
+                    if pastDate <= time[pastBarCnt]
+                        array.push(closes, close[pastBarCnt])
+                        if isDebug
+                            string avg = str.format('{0,number,#.00}', array.avg(closes))
+                            string avg2 = pastDate == time[pastBarCnt] ? avg : avg + ' *'
+                            labelStr := labelStr + ToLabelString(pastBarCnt, avg2)
+                        break
+                        0  // エラー回避の方便
+
+            [array.avg(closes), labelStr, cycle]
+        else
+            [na, na, na]
+
+        [plotVal, labelString, cycle]
+
+
+[pastAvg, tooltipText, pastYear] = GetPast(false)
+int holidayNum = int(rightOffset / 7) * 2
+int plotPosition = rightOffset - holidayNum
+
+
+plot(pastAvg, color=color.new(color.blue, 40), offset=plotPosition)
+
+
+// ツールチップに表示する出力先日付が土日の場合文字列を調整
+plotDateAdjust(_date) =>
+    plotDateAdjust = dayofweek(_date) == dayofweek.saturday ? _date + oneDay * 2 :
+                     dayofweek(_date) == dayofweek.sunday ? _date + oneDay * 1 :
+                     _date
+
+if isDebug
+    tooltipText := '注)下記日付に+1バーするとチャート上の日付になる\n'
+      + 'プロット時も+1の位置に出力\n'
+      + '土日を挟むとずれるので注意\n\n'
+      + str.format('{0} + {1}日 = {2}\n', ToDateString(time), str.tostring(rightOffset), ToDateString(time + oneDay * rightOffset))
+      + 'に下記最終行の平均値を出力\n'
+      + tooltipText
+      + str.format('\n過去{0}年分のデータ', pastYear)
+      + '\nClose Averageの*は市場休日のため翌日の値'
+      + str.format('\n\n土日の日数 {0}', holidayNum)
+      + str.format('\n実オフセット数 {0}-{1}={2}', rightOffset, holidayNum, plotPosition)
+      + '\n\n※土日以外の休場は考慮に入っていませんので、少しずれることがあります。\n右側の日数が多いほどずれます。'
+    //   + str.format("土日調整後のプロット日{0}\n", ToDateString(plotDateAdjust(time+oneDay*rightOffset)))
+    label.new(x=bar_index + plotPosition, y=pastAvg, text='', tooltip=tooltipText, size=size.tiny, color=color.new(color.gray, 92), style=label.style_cross)
+
+if isDebug2
+    if barstate.islast
+        string _barDate = ToDateString(barDate) + '\t' + str.tostring(barDate)
+        string _timenow2 = ToDateString(timenow2) + '\t' + str.tostring(timenow2)
+        string _pastDate = ToDateString(timenow2 - oneDay * rightOffset * 2)
+        label.new(x=bar_index + plotPosition + 9,
+                  y=pastAvg,
+                  text='barDate\t\t\t\t\t' + _barDate + '\ntimenow2\t\t' + _timenow2 + '\npastDate\t\t' + _pastDate,
+                  textalign=text.align_left,
+                  style=label.style_label_center)
