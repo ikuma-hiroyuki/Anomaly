@@ -17,6 +17,10 @@ const int MS_PER_DAY = 24 * 60 * 60 * 1000  // 1日のミリ秒（1000ms * 60s *
 pastDays   = input.int(365, '過去に投影する日数', minval=0, maxval=365, group='表示範囲')
 futureDays = input.int(365, '将来に投影する日数', minval=0, maxval=365, group='表示範囲')
 
+// バックテスト：基準日を最新日ではなく任意の過去日に固定する
+useCustomAnchor = input.bool(false, '基準日を指定する', tooltip='オンにすると任意の過去日を基準日にできます。基準日「より前」の年だけで季節性を計算するため、基準日以降の実際の値動きと予測線を見比べてバックテストできます', group='バックテスト')
+anchorInput     = input.time(timestamp('2025-06-01T00:00'), '基準日', confirm=true, group='バックテスト')
+
 // 入力：予測ロジック ----------------------------------------------------------
 aggMethod    = input.string('平均', '集計方法', options=['平均', '中央値'], tooltip='中央値は異常年（コロナ等）に引っ張られにくい。中央値を選ぶと「直近年を重視」は無視されます。\n\n推奨：まずは「中央値＋±1σバンド」を基準に、当てにいくより季節性の信頼度を見る使い方が堅実です', group='予測ロジック')
 weightRecent = input.bool(false, '直近年を重視（平均時のみ）', group='予測ロジック')
@@ -106,16 +110,19 @@ GetWeekName(int t) =>
 // 最終バーで季節性を一括計算し、前後1年の予測曲線とバンドを描画 -----------------
 var polyline     projection  = na
 var polyline     bandPoly    = na
+var line         anchorLine  = na
 var array<label> debugLabels = array.new<label>()
 
 if barstate.islast and timeframe.isdaily
-    int curYear  = year(timenow)
-    int curMonth = month(timenow)
-    int curDay   = dayofmonth(timenow)
+    // 基準日：最新日（既定）またはユーザー指定の任意日（バックテスト用）
+    int anchorMs = useCustomAnchor ? anchorInput : timenow
+    int curYear  = year(anchorMs)
+    int curMonth = month(anchorMs)
+    int curDay   = dayofmonth(anchorMs)
     int availableYears = curYear - year(firstTime)
 
-    // 基準価格＝直近の確定終値（未確定足では1本前を使い、曲線のチラつきを防ぐ）
-    float baseClose = barstate.isconfirmed ? close : close[1]
+    // 基準価格：指定日ならその日の終値、最新日なら直近の確定終値（チラつき防止）
+    float baseClose = useCustomAnchor ? findCloseAtOrAfter(timestamp(curYear, curMonth, curDay, 0, 0)) : (barstate.isconfirmed ? close : close[1])
 
     // 各過去年の基準日（今日と同じ月日）の終値をキャッシュ
     array<float> baselines = array.new<float>()
@@ -127,6 +134,8 @@ if barstate.islast and timeframe.isdaily
         polyline.delete(projection)
     if not na(bandPoly)
         polyline.delete(bandPoly)
+    if not na(anchorLine)
+        line.delete(anchorLine)
     for lb in debugLabels
         label.delete(lb)
     array.clear(debugLabels)
@@ -202,6 +211,11 @@ if barstate.islast and timeframe.isdaily
     // 前後1年の季節性予測曲線（前面）
     if array.size(centerPts) >= 2
         projection := polyline.new(centerPts, curved=isCurved, xloc=xloc.bar_time, line_color=lineColor, line_width=lineWidth, line_style=plLineStyle)
+
+    // 基準日マーカー（バックテスト時のみ、縦の点線）
+    if useCustomAnchor and not na(baseClose)
+        int anchorDispMs = timestamp(curYear, curMonth, curDay, 0, 0)
+        anchorLine := line.new(anchorDispMs, baseClose, anchorDispMs, baseClose, xloc=xloc.bar_time, extend=extend.both, color=color.new(color.gray, 50), style=line.style_dashed)
 
 // 日足以外では動作しない旨を一度だけ表示
 var label warnLabel = na
