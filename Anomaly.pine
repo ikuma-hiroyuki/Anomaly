@@ -1,112 +1,122 @@
 // This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
 // © Ikuma-Hiroyuki
 
-//@version=5
+//@version=6
 
-indicator('Anomaly Trend', 'Anomaly', overlay=true, max_labels_count=180, scale=scale.right)
+// Anomaly Trend — 過去の同じ月日（同日）の値動きを年をまたいで集計し、
+// 最新の確定終値を基準に「前後1年」の季節性予測曲線を描画する。
+// 各年を基準日でリベースして対数リターンを平均することで、価格水準のトレンドに
+// 引っ張られない季節性パターンを抽出する。日足チャート専用。
 
-string rightOffsetTooltip = '過去同日の終値を平均し将来の日付に表示します。' + '\n同日が休日だった場合その翌日終値を取得します。\n(日足チャートのみ有効)'
-int rightOffset = input.int(defval=60, title='チャート右側の日数', tooltip=rightOffsetTooltip, minval=1, maxval=90)
-bool isDebug = input.bool(defval=true, title='Debug', tooltip='取得した過去同日の日付と価格を表示します')
-bool isDebug2 = input(defval=false, title='Debug2')
+indicator('Anomaly Trend', 'Anomaly', overlay=true, scale=scale.right, max_labels_count=500)
 
-int oneDay = 86400000  // 1000ミリ秒*3600秒*24時間
-int oneYear = 31536000000  // 86400000*365日
+// 定数 ------------------------------------------------------------------------
+const int MS_PER_DAY = 24 * 60 * 60 * 1000  // 1日のミリ秒（1000ms * 60s * 60m * 24h）
 
-int barDate = timestamp(year(time), month(time), dayofmonth(time), 0, 0)  // バーの日にち。0時で固定
-int timenow2 = timestamp(year(timenow), month(timenow), dayofmonth(timenow), 0, 0) - oneDay  // 最新の取引所の日にちはtimenowから-1日
-int lastPastDate = timenow2 - oneDay * rightOffset * 2  // 最古の遡り基準日。この日+rightOffset分先にプロットする
+// 入力 ------------------------------------------------------------------------
+pastDays   = input.int(365, '過去に投影する日数', minval=0, maxval=365, group='表示範囲')
+futureDays = input.int(365, '将来に投影する日数', minval=0, maxval=365, group='表示範囲')
 
+lineColor = input.color(color.new(color.blue, 0), '線の色',      group='スタイル')
+lineWidth = input.int(2,    '線の太さ', minval=1,                group='スタイル')
+lineStyle = input.string('実線', '線の種類', options=['実線', '点線', '破線'], group='スタイル')
+isCurved  = input.bool(true, '曲線を滑らかに描画',               group='スタイル')
 
-ToDateString(_time) =>
-    weekName = dayofweek(_time) == dayofweek.monday    ? '月' :
-               dayofweek(_time) == dayofweek.tuesday   ? '火' :
-               dayofweek(_time) == dayofweek.wednesday ? '水' :
-               dayofweek(_time) == dayofweek.thursday  ? '木' :
-               dayofweek(_time) == dayofweek.friday    ? '金' :
-               dayofweek(_time) == dayofweek.saturday  ? '土' :
-               dayofweek(_time) == dayofweek.sunday    ? '日' :
-               ''
-    str.format('{0,date,Y-MM-dd}-{1}', _time, weekName)
+// 線の種類を polyline 用の定数へ変換
+plLineStyle = lineStyle == '点線' ? line.style_dotted :
+              lineStyle == '破線' ? line.style_dashed : line.style_solid
 
+isDebug    = input.bool(false, 'デバッグ表示', tooltip='間引いた日付に、季節性値と過去同日の内訳をツールチップ表示します', group='デバッグ')
+debugEvery = input.int(30, 'デバッグ表示の間引き（N日ごと）', minval=1,         group='デバッグ')
 
-ToLabelString(_pastBarCnt, _closeAvg) =>
-    ToDateString(time[_pastBarCnt]) + '\t' + str.tostring(close[_pastBarCnt], format.mintick) + '\t\t' + _closeAvg + '\n'
+// 過去の終値を蓄積するバッファ（全バーを1パスで構築。時刻は昇順）-----------------
+var int          firstTime = time
+var array<int>   timeBuf   = array.new<int>()
+var array<float> closeBuf  = array.new<float>()
 
+if timeframe.isdaily
+    array.push(timeBuf, time)
+    array.push(closeBuf, close)
 
-CalcPastDate(_time, traceBackYear, traceBackDate) =>
-    timestamp(year(_time) - traceBackYear,
-              month(_time),
-              dayofmonth(_time) - traceBackDate,
-              hour(_time),
-              minute(_time))
-              + oneDay * rightOffset
-
-
-GetPast(_isDebug) =>
-    if timeframe.isdaily
-        [plotVal, labelString, cycle] = if barDate >= lastPastDate
-            string labelStr = ''
-            if isDebug
-                labelStr := '(参考)' + ToLabelString(0, '') + '\n' + 'Date\t\t\tClose\t\tClose Average\n'
-
-            float[] closes = array.new_float(0)
-            int cycle = int((time - time[bar_index]) / oneYear)
-            for pastYearCnt = 1 to cycle by 1
-                for pastBarCnt = bar_index to 0 by 1
-                    pastDate = CalcPastDate(time, pastYearCnt, 0)
-                    if pastDate <= time[pastBarCnt]
-                        array.push(closes, close[pastBarCnt])
-                        if isDebug
-                            string avg = str.format('{0,number,#.00}', array.avg(closes))
-                            string avg2 = pastDate == time[pastBarCnt] ? avg : avg + ' *'
-                            labelStr := labelStr + ToLabelString(pastBarCnt, avg2)
-                        break
-                        0  // エラー回避の方便
-
-            [array.avg(closes), labelStr, cycle]
+// targetMs 以上の time を持つ最初のバーの終値を返す（同日 or 翌営業日）。二分探索 O(log n)
+findCloseAtOrAfter(int targetMs) =>
+    int n   = array.size(timeBuf)
+    int lo  = 0
+    int hi  = n - 1
+    int ans = -1
+    while lo <= hi
+        int mid = int((lo + hi) / 2)
+        if array.get(timeBuf, mid) >= targetMs
+            ans := mid
+            hi  := mid - 1
         else
-            [na, na, na]
+            lo  := mid + 1
+    ans >= 0 ? array.get(closeBuf, ans) : na
 
-        [plotVal, labelString, cycle]
+// 曜日名（デバッグ用）
+GetWeekName(int t) =>
+    string w = dayofweek(t) == dayofweek.monday    ? '月' :
+               dayofweek(t) == dayofweek.tuesday   ? '火' :
+               dayofweek(t) == dayofweek.wednesday ? '水' :
+               dayofweek(t) == dayofweek.thursday  ? '木' :
+               dayofweek(t) == dayofweek.friday    ? '金' :
+               dayofweek(t) == dayofweek.saturday  ? '土' : '日'
+    w
 
+// 最終バーで季節性を一括計算し、前後1年の予測曲線を描画 -------------------------
+var polyline     projection  = na
+var array<label> debugLabels = array.new<label>()
 
-[pastAvg, tooltipText, pastYear] = GetPast(false)
-int holidayNum = int(rightOffset / 7) * 2
-int plotPosition = rightOffset - holidayNum
+if barstate.islast and timeframe.isdaily
+    int curYear  = year(timenow)
+    int curMonth = month(timenow)
+    int curDay   = dayofmonth(timenow)
+    int availableYears = curYear - year(firstTime)
 
+    // 基準価格＝直近の確定終値（未確定足では1本前を使い、曲線のチラつきを防ぐ）
+    float baseClose = barstate.isconfirmed ? close : close[1]
 
-plot(pastAvg, color=color.new(color.blue, 40), offset=plotPosition)
+    // 各過去年の基準日（今日と同じ月日）の終値をキャッシュ
+    array<float> baselines = array.new<float>()
+    for y = 1 to availableYears
+        array.push(baselines, findCloseAtOrAfter(timestamp(curYear - y, curMonth, curDay, 0, 0)))
 
+    // 既存の描画をクリア（リアルタイム更新でゴミが残らないように）
+    if not na(projection)
+        polyline.delete(projection)
+    for lb in debugLabels
+        label.delete(lb)
+    array.clear(debugLabels)
 
-// ツールチップに表示する出力先日付が土日の場合文字列を調整
-plotDateAdjust(_date) =>
-    plotDateAdjust = dayofweek(_date) == dayofweek.saturday ? _date + oneDay * 2 :
-                     dayofweek(_date) == dayofweek.sunday ? _date + oneDay * 1 :
-                     _date
+    // 基準日からのオフセット d（暦日）ごとに季節性値を求め、点を構築
+    array<chart.point> points = array.new<chart.point>()
+    for d = -pastDays to futureDays
+        bool wantLabel = isDebug and (d % debugEvery == 0)
+        array<float> logs = array.new<float>()
+        string detail = ''
+        for y = 1 to availableYears
+            float base = array.get(baselines, y - 1)
+            // y年前の同じ月日から d 日後（timestamp が暦日の繰り上げ／繰り下げを正規化）
+            int   sampleMs = timestamp(curYear - y, curMonth, curDay + d, 0, 0)
+            float tgt = findCloseAtOrAfter(sampleMs)
+            if not na(base) and not na(tgt) and base > 0 and tgt > 0
+                array.push(logs, math.log(tgt / base))  // 対数比＝幾何平均の素
+                if wantLabel
+                    detail += str.format('{0,date,yy-MM-dd}-{1}\t{2,number,#.##}\n', sampleMs, GetWeekName(sampleMs), tgt)
+        if array.size(logs) > 0
+            // 対数比の平均を価格に戻す：基準価格 × exp(平均対数比)。d=0 では exp(0)=1 で基準価格に一致
+            float val    = baseClose * math.exp(array.avg(logs))
+            int   dispMs = timestamp(curYear, curMonth, curDay + d, 0, 0)
+            array.push(points, chart.point.from_time(dispMs, val))
+            if wantLabel
+                string tip = str.format('{0,date,yy-MM-dd}\n予測 {1,number,#.##}（{2}年分）\n\nDate\t\tClose\n', dispMs, val, array.size(logs)) + detail
+                array.push(debugLabels, label.new(dispMs, val, '', xloc=xloc.bar_time, style=label.style_cross, size=size.tiny, color=color.new(color.gray, 70), tooltip=tip))
 
-if isDebug
-    tooltipText := '注)下記日付に+1バーするとチャート上の日付になる\n'
-      + 'プロット時も+1の位置に出力\n'
-      + '土日を挟むとずれるので注意\n\n'
-      + str.format('{0} + {1}日 = {2}\n', ToDateString(time), str.tostring(rightOffset), ToDateString(time + oneDay * rightOffset))
-      + 'に下記最終行の平均値を出力\n'
-      + tooltipText
-      + str.format('\n過去{0}年分のデータ', pastYear)
-      + '\nClose Averageの*は市場休日のため翌日の値'
-      + str.format('\n\n土日の日数 {0}', holidayNum)
-      + str.format('\n実オフセット数 {0}-{1}={2}', rightOffset, holidayNum, plotPosition)
-      + '\n\n※土日以外の休場は考慮に入っていませんので、少しずれることがあります。\n右側の日数が多いほどずれます。'
-    //   + str.format("土日調整後のプロット日{0}\n", ToDateString(plotDateAdjust(time+oneDay*rightOffset)))
-    label.new(x=bar_index + plotPosition, y=pastAvg, text='', tooltip=tooltipText, size=size.tiny, color=color.new(color.gray, 92), style=label.style_cross)
+    // 前後1年の季節性予測曲線
+    if array.size(points) >= 2
+        projection := polyline.new(points, curved=isCurved, xloc=xloc.bar_time, line_color=lineColor, line_width=lineWidth, line_style=plLineStyle)
 
-if isDebug2
-    if barstate.islast
-        string _barDate = ToDateString(barDate) + '\t' + str.tostring(barDate)
-        string _timenow2 = ToDateString(timenow2) + '\t' + str.tostring(timenow2)
-        string _pastDate = ToDateString(timenow2 - oneDay * rightOffset * 2)
-        label.new(x=bar_index + plotPosition + 9,
-                  y=pastAvg,
-                  text='barDate\t\t\t\t\t' + _barDate + '\ntimenow2\t\t' + _timenow2 + '\npastDate\t\t' + _pastDate,
-                  textalign=text.align_left,
-                  style=label.style_label_center)
+// 日足以外では動作しない旨を一度だけ表示
+var label warnLabel = na
+if barstate.islast and not timeframe.isdaily and na(warnLabel)
+    warnLabel := label.new(bar_index, close, '「Anomaly」は日足チャートでのみ動作します', style=label.style_label_down, color=color.new(color.red, 0), textcolor=color.white)
