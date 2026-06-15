@@ -47,12 +47,14 @@ isDebug    = input.bool(false, 'デバッグ表示', tooltip='間引いた日付
 debugEvery = input.int(30, 'デバッグ表示の間引き（N日ごと）', minval=1, group='デバッグ')
 
 // 過去の終値を蓄積するバッファ（全バーを1パスで構築。時刻は昇順）-----------------
+// キーはバーの「取引日（終値の暦日）」の0:00。先物は始値時刻が前日夜になるため、
+// time（始値）で揃えるとチャート軸の取引日と1日ずれる。time_close の日付で揃える。
 var int          firstTime = time
 var array<int>   timeBuf   = array.new<int>()
 var array<float> closeBuf  = array.new<float>()
 
 if timeframe.isdaily
-    array.push(timeBuf, time)
+    array.push(timeBuf, timestamp(year(time_close), month(time_close), dayofmonth(time_close), 0, 0))
     array.push(closeBuf, close)
 
 // targetMs 以上の time を持つ最初のバーの終値を返す（同日 or 翌営業日）。二分探索 O(log n)
@@ -121,6 +123,10 @@ if barstate.islast and timeframe.isdaily
     int curDay   = dayofmonth(anchorMs)
     int availableYears = curYear - year(firstTime)
 
+    // 始値オフセット：このバーの始値時刻 − 取引日0:00（先物は前日夜開始のため負値）。
+    // マーカー等の表示位置をローソクの始値時刻に合わせ、軸の取引日と一致させる。
+    int openOffset = time - timestamp(year(time_close), month(time_close), dayofmonth(time_close), 0, 0)
+
     // 基準価格：指定日ならその日の終値、最新日なら直近の確定終値（チラつき防止）
     float baseClose = useCustomAnchor ? findCloseAtOrAfter(timestamp(curYear, curMonth, curDay, 0, 0)) : (barstate.isconfirmed ? close : close[1])
 
@@ -186,7 +192,8 @@ if barstate.islast and timeframe.isdaily
         float cl = array.get(centerLogArr, idx)
         if not na(cl)
             int   d      = idx - pastDays
-            int   dispMs = timestamp(curYear, curMonth, curDay + d, 0, 0)
+            int   dateMs = timestamp(curYear, curMonth, curDay + d, 0, 0)  // 日付テキスト用（取引日0:00）
+            int   dispMs = dateMs + openOffset                            // 表示位置用（ローソクの始値時刻に合わせる）
             // 基準価格 × exp(中心対数比)。d=0 では exp(0)=1 で基準価格に一致
             float center = baseClose * math.exp(cl)
             array.push(centerPts, chart.point.from_time(dispMs, center))
@@ -196,7 +203,7 @@ if barstate.islast and timeframe.isdaily
                     array.push(upperPts, chart.point.from_time(dispMs, baseClose * math.exp(cl + bandMult * sd)))
                     array.push(lowerPts, chart.point.from_time(dispMs, baseClose * math.exp(cl - bandMult * sd)))
             if isDebug and (d % debugEvery == 0)
-                string tip = str.format('{0,date,yy-MM-dd}\n予測 {1,number,#.##}\n\nDate\t\tClose\n', dispMs, center) + array.get(detailArr, idx)
+                string tip = str.format('{0,date,yy-MM-dd}\n予測 {1,number,#.##}\n\nDate\t\tClose\n', dateMs, center) + array.get(detailArr, idx)
                 array.push(debugLabels, label.new(dispMs, center, '', xloc=xloc.bar_time, style=label.style_cross, size=size.tiny, color=color.new(color.gray, 70), tooltip=tip))
 
     // 信頼区間バンド：上端（左→右）と下端（右→左）を繋いだ閉領域を塗りつぶし（背面）
@@ -214,7 +221,7 @@ if barstate.islast and timeframe.isdaily
 
     // 基準日マーカー（バックテスト時のみ、縦の点線）
     if useCustomAnchor and not na(baseClose)
-        int anchorDispMs = timestamp(curYear, curMonth, curDay, 0, 0)
+        int anchorDispMs = timestamp(curYear, curMonth, curDay, 0, 0) + openOffset
         anchorLine := line.new(anchorDispMs, baseClose, anchorDispMs, baseClose, xloc=xloc.bar_time, extend=extend.both, color=color.new(color.gray, 50), style=line.style_dashed)
 
 // 日足以外では動作しない旨を一度だけ表示
