@@ -43,8 +43,15 @@ plLineStyle = lineStyle == '点線' ? line.style_dotted :
               lineStyle == '破線' ? line.style_dashed : line.style_solid
 
 // 入力：デバッグ --------------------------------------------------------------
-isDebug    = input.bool(false, 'デバッグ表示', tooltip='間引いた日付に、季節性値と過去同日の内訳をツールチップ表示します', group='デバッグ')
+isDebug    = input.bool(false, 'デバッグ表示', tooltip='間引いた日付に、季節性値・騰落方向の確率・過去同日の内訳をツールチップ表示します', group='デバッグ')
 debugEvery = input.int(30, 'デバッグ表示の間引き（N日ごと）', minval=1, group='デバッグ')
+debugStyle = input.string('円', 'デバッグマーカーの形', options=['円', '十字', 'バツ', '菱形', '四角'], group='デバッグ')
+
+// マーカーの形を label 用の定数へ変換
+markerStyle = debugStyle == '十字' ? label.style_cross   :
+              debugStyle == 'バツ' ? label.style_xcross  :
+              debugStyle == '菱形' ? label.style_diamond :
+              debugStyle == '四角' ? label.style_square  : label.style_circle
 
 // 過去の終値を蓄積するバッファ（全バーを1パスで構築。時刻は昇順）-----------------
 // キーはバーの「取引日（終値の暦日）」の0:00。先物は始値時刻が前日夜になるため、
@@ -150,6 +157,8 @@ if barstate.islast and timeframe.isdaily
     array<float>  centerLogArr = array.new<float>(total, na)  // 各オフセットの中心対数比
     array<float>  sigmaArr     = array.new<float>(total, na)  // 各オフセットの対数標準偏差
     array<string> detailArr    = array.new<string>(total, '') // デバッグ内訳
+    array<int>    upCountArr   = array.new<int>(total, 0)     // 各オフセットの上昇年数（基準日比 tgt>base）
+    array<int>    cntArr       = array.new<int>(total, 0)     // 各オフセットの有効サンプル年数
 
     // パス1：基準日からのオフセット d（暦日）ごとに、対数比の中心値とばらつきを求める
     for d = -pastDays to futureDays
@@ -178,6 +187,12 @@ if barstate.islast and timeframe.isdaily
             array.set(sigmaArr, idx, sd)
             if wantLabel
                 array.set(detailArr, idx, detail)
+                int up = 0
+                for lv in logs
+                    if lv > 0
+                        up += 1
+                array.set(upCountArr, idx, up)
+                array.set(cntArr, idx, array.size(logs))
 
     // パス2：対数空間で平滑化（移動平均）
     if smoothLen > 1
@@ -203,8 +218,14 @@ if barstate.islast and timeframe.isdaily
                     array.push(upperPts, chart.point.from_time(dispMs, baseClose * math.exp(cl + bandMult * sd)))
                     array.push(lowerPts, chart.point.from_time(dispMs, baseClose * math.exp(cl - bandMult * sd)))
             if isDebug and (d % debugEvery == 0)
-                string tip = str.format('{0,date,yy-MM-dd}\n予測 {1,number,#.##}\n\nDate\t\tClose\n', dateMs, center) + array.get(detailArr, idx)
-                array.push(debugLabels, label.new(dispMs, center, '', xloc=xloc.bar_time, style=label.style_cross, size=size.tiny, color=color.new(color.gray, 70), tooltip=tip))
+                // 騰落方向の確率：予測線の向き（中心対数比 cl の符号）に対し、過去その方向へ動いた年の割合
+                int    up      = array.get(upCountArr, idx)
+                int    cnt     = array.get(cntArr, idx)
+                string dirTxt  = cl > 0 ? '上昇' : cl < 0 ? '下落' : '横ばい'
+                int    hit     = cl >= 0 ? up : cnt - up
+                string probLine = cnt > 0 ? str.format('{0} {1,number,#}%（{2}年中{3}年）\n', dirTxt, hit * 100.0 / cnt, cnt, hit) : ''
+                string tip = str.format('{0,date,yy-MM-dd}\n予測 {1,number,#.##}\n', dateMs, center) + probLine + '\nDate\t\tClose\n' + array.get(detailArr, idx)
+                array.push(debugLabels, label.new(dispMs, center, '', xloc=xloc.bar_time, style=markerStyle, size=size.tiny, color=color.new(color.gray, 70), tooltip=tip))
 
     // 信頼区間バンド：上端（左→右）と下端（右→左）を繋いだ閉領域を塗りつぶし（背面）
     if showBand and array.size(upperPts) >= 2 and array.size(lowerPts) >= 2
