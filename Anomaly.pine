@@ -222,13 +222,12 @@ if barstate.islast and timeframe.isdaily
                     array.push(upperPts, chart.point.from_time(dispMs, baseClose * math.exp(cl + bandMult * sd)))
                     array.push(lowerPts, chart.point.from_time(dispMs, baseClose * math.exp(cl - bandMult * sd)))
             if isDebug and (d % debugEvery == 0)
-                // 騰落方向の確率：予測線の傾き（前オフセット比）に対し、過去前日比で同方向に動いた年の割合
-                float  prevCl  = idx > 0 ? array.get(centerLogArr, idx - 1) : na
-                bool   slopeUp = not na(prevCl) ? cl > prevCl : cl > 0
+                // 騰落方向の確率：過去の前日比で多数派の方向とその割合
                 int    up      = array.get(upCountArr, idx)
                 int    cnt     = array.get(cntArr, idx)
-                string dirTxt  = slopeUp ? '上昇' : '下落'
-                int    hit     = slopeUp ? up : cnt - up
+                bool   majUp   = up * 2 >= cnt
+                string dirTxt  = majUp ? '上昇' : '下落'
+                int    hit     = majUp ? up : cnt - up
                 string probLine = cnt > 0 ? str.format('{0} {1,number,#}%（{2}年中{3}年）\n', dirTxt, hit * 100.0 / cnt, cnt, hit) : ''
                 string tip = str.format('{0,date,yy-MM-dd}\n予測 {1,number,#.##}\n', dateMs, center) + probLine + '\nDate\t\tClose\n' + array.get(detailArr, idx)
                 array.push(debugLabels, label.new(dispMs, center, '', xloc=xloc.bar_time, style=markerStyle, size=size.tiny, color=color.new(color.gray, 70), tooltip=tip))
