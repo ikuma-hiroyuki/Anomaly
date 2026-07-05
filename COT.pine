@@ -1,0 +1,97 @@
+//@version=6
+
+// このインジケーターは、CFTC（米国商品先物取引委員会）が毎週公表する
+// 「Commitments of Traders (COT)レポート」をTradingView上で表示します。
+//
+// 【3つの分類の意味】
+//
+// ① Commercials（コマーシャルズ / 赤）
+//    → 事業者（生産者、商社、メーカー、金融機関など）
+//    → 現物ビジネスを守るための実需ヘッジ目的
+//    → 市場で最も「賢い」とされるグループ。極端なポジションは逆張りシグナルとして注目される。
+//
+// ② Large Spec（ラージスペック / 緑）
+//    → 大口投機筋（ヘッジファンド、CTA、機関投資家など）
+//    → 利益追求のための投機目的
+//    → トレンドに追従しやすいグループ。
+//
+// ③ Small Spec（スモールスペック / 青）
+//    → 小口投機家（一般個人投資家など）
+//    → 報告義務のない小さなポジション
+//    → 感情的になりやすく、天底で逆張りしやすい（逆指標として有用）。
+//
+// ── 使い方 ───────────────────────────────────
+// • プラス = 買い越し　／　マイナス = 売り越し
+// • 主に「Commercials vs Large Spec」の動きを比較して使用
+// • 「オプションも含める」をONにすると先物＋オプションの合算値になります。
+
+indicator('Commitments Of Traders', 'COT', precision=0)
+
+isOption = input.bool(defval=false, title='オプションも含める', group='設定',
+ tooltip='先物に加えてオプション残高も加算します。')
+
+input.bool(defval=false, title='シナリオ一覧（?マークにカーソルで詳細表示）', group='シナリオ読み方',
+ tooltip=
+ '【シナリオ別・市場の見方】\n\n' +
+ '① 底入れ・強気転換\n' +
+ '　Comm=買い越し拡大 / Large=売り or 中立 / Small=極端な売り越し\n' +
+ '　→ 最もクラシックな強気シグナル。実需が買い支え、大口がまだ弱気、小口が恐怖で売っている状態。底打ち→上昇の前兆になりやすい。\n\n' +
+ '② 天井・弱気転換\n' +
+ '　Comm=売り越し拡大 / Large=買い越し拡大 / Small=極端な買い越し\n' +
+ '　→ クラシックな弱気シグナル。実需がリスクヘッジして売り、大口が強気で乗り、小口が楽観で買い過ぎている状態。\n\n' +
+ '③ トレンド継続（強気相場中）\n' +
+ '　Comm=買い越し維持 or 緩やか増加 / Large=買い越し拡大 / Small=買い越し\n' +
+ '　→ 実需が安心してポジション保持、大口がトレンドに乗っている。上昇トレンド継続の典型。\n\n' +
+ '④ トレンド継続（弱気相場中）\n' +
+ '　Comm=売り越し維持 or 拡大 / Large=売り越し拡大 / Small=売り越し\n' +
+ '　→ 下降トレンドが続きやすい。\n\n' +
+ '⑤ 逆張り機会（ダイバージェンス）\n' +
+ '　Comm=極端買い越し / Large=極端売り越し / Small=中立〜売り\n' +
+ '　→ 大口が弱気なのに実需が強い支持。強い底入れシグナル（ESやNQでよく機能）。\n\n' +
+ '⑥ 危険シグナル（過熱）\n' +
+ '　Comm=中立〜売り越し / Large=極端買い越し / Small=極端買い越し\n' +
+ '　→ 大口・小口が揃って強気なのに実需がヘッジを強めている。天井警戒。\n\n' +
+ '⑦ 方向感なし（レンジ相場）\n' +
+ '　Comm=中立付近 / Large=中立〜小幅 / Small=中立\n' +
+ '　→ 3者ともポジションが小さく方向感に乏しい。大きな動きの前兆の場合が多い。\n\n' +
+ '⑧ 小口逆指標\n' +
+ '　Small=極端な片側ポジション\n' +
+ '　→ 小口だけが極端に買い越し/売り越しで、他の2グループと逆行していれば反転の確率が高まる。')
+
+getCode() =>
+    base = switch syminfo.root
+        'NQ'     => '209742'
+        'ES'     => '13874A'
+        'ZB'     => '020601'
+        'UB'     => '020604'
+        'GC'     => '088691'
+        'DX'     => '098662'
+        '6J'     => '097741'
+        'USDJPY' => '097741'
+        'NK225'  => '240743'
+        'NKD'    => '240741'
+        'YM'     => '124603'
+        =>         ''
+    base + (isOption ? '_FO' : '_F')
+
+string code = getCode()
+
+netPosition(traderClass) =>
+    long  = request.security(code + traderClass + '_L', '', close)
+    short = request.security(code + traderClass + '_S', '', close)
+    long - short
+
+float commercial = netPosition('_CP')
+float largeSpec  = netPosition('_NCP')
+float smallSpec  = netPosition('_NRP')
+
+plot(commercial, title='Commercials', color=color.red)
+plot(largeSpec,  title='Large Spec',  color=color.green)
+plot(smallSpec,  title='Small Spec',  color=color.blue)
+
+hline(0, editable=false)
+
+if barstate.islast
+    label.new(bar_index, commercial, '実需ヘッジ', color=color.new(color.red,   80), textcolor=color.red,   style=label.style_label_upper_right, size=size.small)
+    label.new(bar_index, largeSpec,  '機関投資家',  color=color.new(color.green, 80), textcolor=color.green, style=label.style_label_upper_right, size=size.small)
+    label.new(bar_index, smallSpec,  '小口投資家',  color=color.new(color.blue,  80), textcolor=color.blue,  style=label.style_label_upper_right, size=size.small)
