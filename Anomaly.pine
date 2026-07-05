@@ -1,0 +1,256 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Ikuma-Hiroyuki
+
+//@version=6
+
+// Anomaly Trend — 過去の同じ月日（同日）の値動きを年をまたいで集計し、
+// 最新の確定終値を基準に「前後1年」の季節性予測曲線を描画する。
+// 各年を基準日でリベースして対数リターンを平均することで、価格水準のトレンドに
+// 引っ張られない季節性パターンを抽出する。日足チャート専用。
+
+indicator('Anomaly Trend', 'Anomaly', overlay=true, scale=scale.right, max_labels_count=500)
+
+// 定数 ------------------------------------------------------------------------
+const int MS_PER_DAY = 24 * 60 * 60 * 1000  // 1日のミリ秒（1000ms * 60s * 60m * 24h）
+
+// 入力：表示範囲 --------------------------------------------------------------
+pastDays   = input.int(365, '過去に投影する日数', minval=0, maxval=365, group='表示範囲')
+futureDays = input.int(365, '将来に投影する日数', minval=0, maxval=365, group='表示範囲')
+
+// バックテスト：基準日を最新日ではなく任意の過去日に固定する
+useCustomAnchor = input.bool(false, '基準日を指定する', tooltip='オンにすると任意の過去日を基準日にできます。基準日「より前」の年だけで季節性を計算するため、基準日以降の実際の値動きと予測線を見比べてバックテストできます', group='バックテスト')
+anchorInput     = input.time(timestamp('2025-06-01T00:00'), '基準日', group='バックテスト')
+
+// 入力：予測ロジック ----------------------------------------------------------
+aggMethod    = input.string('平均', '集計方法', options=['平均', '中央値'], tooltip='中央値は異常年（コロナ等）に引っ張られにくい。中央値を選ぶと「直近年を重視」は無視されます。\n\n推奨：まずは「中央値＋±1σバンド」を基準に、当てにいくより季節性の信頼度を見る使い方が堅実です', group='予測ロジック')
+weightRecent = input.bool(false, '直近年を重視（平均時のみ）', group='予測ロジック')
+weightDecay  = input.float(0.85, '直近重視の減衰率', minval=0.1, maxval=1.0, step=0.05, tooltip='1に近いほど均等、小さいほど直近年を強く重視。\n\n※強めるほど過剰最適化のリスク。季節性は長期的に繰り返すから価値があるという前提とのトレードオフです', group='予測ロジック')
+smoothLen    = input.int(1, '平滑化の日数（1で無効）', minval=1, maxval=30, tooltip='前後N日の移動平均で日次ノイズを除去。\n\n※大きくしすぎると過剰最適化（過去に当たって見えるだけ）になりがち。控えめが無難です', group='予測ロジック')
+
+// 入力：信頼区間バンド --------------------------------------------------------
+showBand  = input.bool(false, '信頼区間バンドを表示', group='信頼区間')
+bandMult  = input.float(1.0, 'バンドの幅（σの倍率）', minval=0.5, maxval=3.0, step=0.5, group='信頼区間')
+bandColor = input.color(color.new(color.blue, 85), 'バンドの色', group='信頼区間')
+
+// 入力：スタイル --------------------------------------------------------------
+lineColor = input.color(color.new(color.blue, 0), '線の色',      group='スタイル')
+lineWidth = input.int(2,    '線の太さ', minval=1,                group='スタイル')
+lineStyle = input.string('実線', '線の種類', options=['実線', '点線', '破線'], group='スタイル')
+isCurved  = input.bool(true, '曲線を滑らかに描画',               group='スタイル')
+
+// 線の種類を polyline 用の定数へ変換
+plLineStyle = lineStyle == '点線' ? line.style_dotted :
+              lineStyle == '破線' ? line.style_dashed : line.style_solid
+
+// 入力：デバッグ --------------------------------------------------------------
+isDebug    = input.bool(false, 'デバッグ表示', tooltip='間引いた日付に、季節性値・騰落方向の確率・過去同日の内訳をツールチップ表示します', group='デバッグ')
+debugEvery = input.int(30, 'デバッグ表示の間引き（N日ごと）', minval=1, group='デバッグ')
+debugStyle = input.string('円', 'デバッグマーカーの形', options=['円', '十字', 'バツ', '菱形', '四角'], group='デバッグ')
+
+// マーカーの形を label 用の定数へ変換
+markerStyle = debugStyle == '十字' ? label.style_cross   :
+              debugStyle == 'バツ' ? label.style_xcross  :
+              debugStyle == '菱形' ? label.style_diamond :
+              debugStyle == '四角' ? label.style_square  : label.style_circle
+
+// 過去の終値を蓄積するバッファ（全バーを1パスで構築。時刻は昇順）-----------------
+// キーはバーの「取引日（終値の暦日）」の0:00。先物は始値時刻が前日夜になるため、
+// time（始値）で揃えるとチャート軸の取引日と1日ずれる。time_close の日付で揃える。
+var int          firstTime = time
+var array<int>   timeBuf   = array.new<int>()
+var array<float> closeBuf  = array.new<float>()
+
+if timeframe.isdaily
+    array.push(timeBuf, timestamp(year(time_close), month(time_close), dayofmonth(time_close), 0, 0))
+    array.push(closeBuf, close)
+
+// targetMs 以上の time を持つ最初のバーの終値を返す（同日 or 翌営業日）。二分探索 O(log n)
+findCloseAtOrAfter(int targetMs) =>
+    int n   = array.size(timeBuf)
+    int lo  = 0
+    int hi  = n - 1
+    int ans = -1
+    while lo <= hi
+        int mid = int((lo + hi) / 2)
+        if array.get(timeBuf, mid) >= targetMs
+            ans := mid
+            hi  := mid - 1
+        else
+            lo  := mid + 1
+    ans >= 0 ? array.get(closeBuf, ans) : na
+
+// 重み付き平均（直近年を重視するときに使用）
+weightedMean(array<float> vals, array<float> wts) =>
+    float sumW  = 0.0
+    float sumWV = 0.0
+    for i = 0 to array.size(vals) - 1
+        float w = array.get(wts, i)
+        sumW  += w
+        sumWV += w * array.get(vals, i)
+    sumW > 0 ? sumWV / sumW : na
+
+// na を無視する中心移動平均（カーブ平滑化用）
+smoothArray(array<float> src, int len) =>
+    int n = array.size(src)
+    array<float> dst = array.new<float>(n, na)
+    int half = int(len / 2)
+    for i = 0 to n - 1
+        float sum = 0.0
+        int   cnt = 0
+        for j = math.max(0, i - half) to math.min(n - 1, i + half)
+            float v = array.get(src, j)
+            if not na(v)
+                sum += v
+                cnt += 1
+        if cnt > 0
+            array.set(dst, i, sum / cnt)
+    dst
+
+// 曜日名（デバッグ用）
+GetWeekName(int t) =>
+    string w = dayofweek(t) == dayofweek.monday    ? '月' :
+               dayofweek(t) == dayofweek.tuesday   ? '火' :
+               dayofweek(t) == dayofweek.wednesday ? '水' :
+               dayofweek(t) == dayofweek.thursday  ? '木' :
+               dayofweek(t) == dayofweek.friday    ? '金' :
+               dayofweek(t) == dayofweek.saturday  ? '土' : '日'
+    w
+
+// 最終バーで季節性を一括計算し、前後1年の予測曲線とバンドを描画 -----------------
+var polyline     projection  = na
+var polyline     bandPoly    = na
+var line         anchorLine  = na
+var array<label> debugLabels = array.new<label>()
+
+if barstate.islast and timeframe.isdaily
+    // 基準日：最新日（既定）またはユーザー指定の任意日（バックテスト用）
+    int anchorMs = useCustomAnchor ? anchorInput : timenow
+    int curYear  = year(anchorMs)
+    int curMonth = month(anchorMs)
+    int curDay   = dayofmonth(anchorMs)
+    int availableYears = curYear - year(firstTime)
+
+    // 始値オフセット：このバーの始値時刻 − 取引日0:00（先物は前日夜開始のため負値）。
+    // マーカー等の表示位置をローソクの始値時刻に合わせ、軸の取引日と一致させる。
+    int openOffset = time - timestamp(year(time_close), month(time_close), dayofmonth(time_close), 0, 0)
+
+    // 基準価格：指定日ならその日の終値、最新日なら直近の確定終値（チラつき防止）
+    float baseClose = useCustomAnchor ? findCloseAtOrAfter(timestamp(curYear, curMonth, curDay, 0, 0)) : (barstate.isconfirmed ? close : close[1])
+
+    // 各過去年の基準日（今日と同じ月日）の終値をキャッシュ
+    array<float> baselines = array.new<float>()
+    for y = 1 to availableYears
+        array.push(baselines, findCloseAtOrAfter(timestamp(curYear - y, curMonth, curDay, 0, 0)))
+
+    // 既存の描画をクリア（リアルタイム更新でゴミが残らないように）
+    if not na(projection)
+        polyline.delete(projection)
+    if not na(bandPoly)
+        polyline.delete(bandPoly)
+    if not na(anchorLine)
+        line.delete(anchorLine)
+    for lb in debugLabels
+        label.delete(lb)
+    array.clear(debugLabels)
+
+    int total = pastDays + futureDays + 1
+    array<float>  centerLogArr = array.new<float>(total, na)  // 各オフセットの中心対数比
+    array<float>  sigmaArr     = array.new<float>(total, na)  // 各オフセットの対数標準偏差
+    array<string> detailArr    = array.new<string>(total, '') // デバッグ内訳
+    array<int>    upCountArr   = array.new<int>(total, 0)     // 各オフセットの前日比上昇年数（デバッグ用）
+    array<int>    cntArr       = array.new<int>(total, 0)     // 各オフセットの前日比有効サンプル年数（デバッグ用）
+
+    // パス1：基準日からのオフセット d（暦日）ごとに、対数比の中心値とばらつきを求める
+    for d = -pastDays to futureDays
+        int  idx = d + pastDays
+        bool wantLabel = isDebug and (d % debugEvery == 0)
+        array<float> logs    = array.new<float>()
+        array<float> weights = array.new<float>()
+        string detail = ''
+        int dayUp  = 0
+        int dayCnt = 0
+        for y = 1 to availableYears
+            float base = array.get(baselines, y - 1)
+            // y年前の同じ月日から d 日後（timestamp が暦日の繰り上げ／繰り下げを正規化）
+            int   sampleMs = timestamp(curYear - y, curMonth, curDay + d, 0, 0)
+            float tgt = findCloseAtOrAfter(sampleMs)
+            if not na(base) and not na(tgt) and base > 0 and tgt > 0
+                array.push(logs, math.log(tgt / base))           // 対数比＝幾何平均の素
+                array.push(weights, math.pow(weightDecay, y - 1)) // 直近年ほど重みを大きく
+                if wantLabel
+                    detail += str.format('{0,date,yy-MM-dd}-{1}\t{2,number,#.##}\n', sampleMs, GetWeekName(sampleMs), tgt)
+                    // 前日比カウント（デバッグ用）
+                    float prevTgt = findCloseAtOrAfter(timestamp(curYear - y, curMonth, curDay + d - 1, 0, 0))
+                    if not na(prevTgt) and prevTgt > 0
+                        if tgt > prevTgt
+                            dayUp += 1
+                        dayCnt += 1
+        if array.size(logs) > 0
+            // 集計方法：中央値（外れ値に強い）／加重平均（直近重視）／単純平均
+            float center = aggMethod == '中央値' ? array.median(logs) :
+                           weightRecent          ? weightedMean(logs, weights) :
+                           array.avg(logs)
+            float sd = array.size(logs) >= 2 ? array.stdev(logs) : 0.0
+            array.set(centerLogArr, idx, center)
+            array.set(sigmaArr, idx, sd)
+            if wantLabel
+                array.set(detailArr, idx, detail)
+                array.set(upCountArr, idx, dayUp)
+                array.set(cntArr, idx, dayCnt)
+
+    // パス2：対数空間で平滑化（移動平均）
+    if smoothLen > 1
+        centerLogArr := smoothArray(centerLogArr, smoothLen)
+        sigmaArr     := smoothArray(sigmaArr, smoothLen)
+
+    // パス3：価格へ戻して点を構築（中心線・上下バンド）
+    array<chart.point> centerPts = array.new<chart.point>()
+    array<chart.point> upperPts  = array.new<chart.point>()
+    array<chart.point> lowerPts  = array.new<chart.point>()
+    for idx = 0 to total - 1
+        float cl = array.get(centerLogArr, idx)
+        if not na(cl)
+            int   d      = idx - pastDays
+            int   dateMs = timestamp(curYear, curMonth, curDay + d, 0, 0)  // 日付テキスト用（取引日0:00）
+            int   dispMs = dateMs + openOffset                            // 表示位置用（ローソクの始値時刻に合わせる）
+            // 基準価格 × exp(中心対数比)。d=0 では exp(0)=1 で基準価格に一致
+            float center = baseClose * math.exp(cl)
+            array.push(centerPts, chart.point.from_time(dispMs, center))
+            if showBand
+                float sd = array.get(sigmaArr, idx)
+                if not na(sd)
+                    array.push(upperPts, chart.point.from_time(dispMs, baseClose * math.exp(cl + bandMult * sd)))
+                    array.push(lowerPts, chart.point.from_time(dispMs, baseClose * math.exp(cl - bandMult * sd)))
+            if isDebug and (d % debugEvery == 0)
+                // 騰落方向の確率：過去の前日比で多数派の方向とその割合
+                int    up      = array.get(upCountArr, idx)
+                int    cnt     = array.get(cntArr, idx)
+                bool   majUp   = up * 2 >= cnt
+                string dirTxt  = majUp ? '上昇' : '下落'
+                int    hit     = majUp ? up : cnt - up
+                string probLine = cnt > 0 ? str.format('{0} {1,number,#}%（{2}年中{3}年）\n', dirTxt, hit * 100.0 / cnt, cnt, hit) : ''
+                string tip = str.format('{0,date,yy-MM-dd}\n予測 {1,number,#.##}\n', dateMs, center) + probLine + '\nDate\t\tClose\n' + array.get(detailArr, idx)
+                array.push(debugLabels, label.new(dispMs, center, '', xloc=xloc.bar_time, style=markerStyle, size=size.tiny, color=color.new(color.gray, 70), tooltip=tip))
+
+    // 信頼区間バンド：上端（左→右）と下端（右→左）を繋いだ閉領域を塗りつぶし（背面）
+    if showBand and array.size(upperPts) >= 2 and array.size(lowerPts) >= 2
+        array<chart.point> bandPts = array.new<chart.point>()
+        for p in upperPts
+            array.push(bandPts, p)
+        for i = array.size(lowerPts) - 1 to 0
+            array.push(bandPts, array.get(lowerPts, i))
+        bandPoly := polyline.new(bandPts, curved=isCurved, closed=true, xloc=xloc.bar_time, line_color=color.new(color.gray, 100), fill_color=bandColor)
+
+    // 前後1年の季節性予測曲線（前面）
+    if array.size(centerPts) >= 2
+        projection := polyline.new(centerPts, curved=isCurved, xloc=xloc.bar_time, line_color=lineColor, line_width=lineWidth, line_style=plLineStyle)
+
+    // 基準日マーカー（バックテスト時のみ、縦の点線）
+    if useCustomAnchor and not na(baseClose)
+        int anchorDispMs = timestamp(curYear, curMonth, curDay, 0, 0) + openOffset
+        anchorLine := line.new(anchorDispMs, baseClose, anchorDispMs, baseClose, xloc=xloc.bar_time, extend=extend.both, color=color.new(color.gray, 50), style=line.style_dashed)
+
+// 日足以外では動作しない旨を一度だけ表示
+var label warnLabel = na
+if barstate.islast and not timeframe.isdaily and na(warnLabel)
+    warnLabel := label.new(bar_index, close, '「Anomaly」は日足チャートでのみ動作します', style=label.style_label_down, color=color.new(color.red, 0), textcolor=color.white)
